@@ -1,0 +1,229 @@
+---
+title: "Financial Industry: Credit Scoring"
+author: "Almas Fathin Irbah"
+output: html_document
+---
+
+```{r}
+install.packages('Ckmeans.1d.dp', dependencies=TRUE)
+```
+
+
+```{r setup, include=FALSE}
+# clear-up the environment
+rm(list = ls())
+# chunk options
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  comment = "#>"
+)
+# scientific notation
+options(scipen = 9999)
+```
+
+```{r}
+library(tidyverse)
+library(rsample)
+library(tidymodels)
+library(caret)
+library(readr)
+library(inspectdf)
+library(lime)
+library(xgboost)
+library(ROCR)
+```
+```{r}
+credit <- read_csv("credit_record.csv")
+application <- read_csv("application_record.csv")
+```
+```{r}
+colSums(is.na(credit))
+```
+```{r}
+colSums(is.na(application))
+```
+```{r}
+application <- application %>% 
+               select(-c(OCCUPATION_TYPE, DAYS_BIRTH, DAYS_EMPLOYED))
+```
+```{r}
+data_clean <- credit %>% 
+              left_join(application) %>% 
+              na.omit() %>% 
+              select(-ID) %>% 
+              filter(STATUS != "X") %>% 
+              mutate(STATUS = as.factor(ifelse(STATUS == "C", "good credit", "bad credit"))) %>% 
+              mutate_at(.vars = c("FLAG_MOBIL", "FLAG_WORK_PHONE",
+                                  "FLAG_PHONE", "FLAG_EMAIL"), as.factor) %>% 
+              mutate_if(is.character, as.factor) %>% 
+              data.frame()
+str(data_clean)
+```
+```{r, echo=FALSE}
+data_clean <- data_clean %>% head(100000)
+```
+```{r}
+data_clean %>% inspect_cat() %>% show_plot()
+```
+```{r}
+data_clean <- data_clean %>% 
+              select(-c(FLAG_MOBIL,FLAG_EMAIL))
+```
+```{r}
+data_clean %>% inspect_num() %>% show_plot()
+```
+```{r}
+set.seed(100)
+index <- initial_split(data = data_clean, prop = 0.8, strata = "STATUS")
+train <- training(index)
+test <- testing(index)
+```
+```{r}
+prop.table(table(train$STATUS))
+```
+```{r}
+set.seed(100)
+
+ctrl <- trainControl(method = "repeatedcv",
+                      number = 3, 
+                      repeats = 2,
+                      allowParallel=FALSE)
+ 
+model_forest <- caret::train(STATUS ~.,
+                              data = train, 
+                              method = "rf", 
+                              trControl = ctrl)
+saveRDS(model_forest, "model_forest.RDS")
+model_forest <- readRDS("model_forest.RDS")
+```
+```{r}
+model_forest
+```
+```{r}
+pred_rf<- predict(model_forest, newdata = test, type = "prob") %>% 
+          mutate(result = as.factor(ifelse(`bad credit` > 0.45, "bad credit", "good credit")),
+                 actual = ifelse(test$STATUS == 'good credit', 0, 1))
+confmat_rf <- confusionMatrix(pred_rf$result, 
+                                 test$STATUS,
+                                 mode = "prec_recall",
+                                 positive = "bad credit")
+eval_rf <- tidy(confmat_rf) %>% 
+  mutate(model = "Random Forest") %>% 
+  select(model, term, estimate) %>% 
+  filter(term %in% c("accuracy", "precision", "recall", "specificity"))
+eval_rf
+```
+```{r}
+data_xgb <- data_clean %>% 
+            mutate(STATUS = ifelse(STATUS == "good credit", 0, 1)) %>% 
+            data.frame()
+```
+```{r}
+set.seed(100)
+index <- initial_split(data = data_xgb, prop = 0.8, strata = "STATUS")
+train_xgb <- training(index)
+test_xgb <- testing(index)
+```
+```{r}
+label_train <- as.numeric(train_xgb$STATUS)
+label_test <- as.numeric(test_xgb$STATUS)
+```
+```{r}
+train_matrix <- data.matrix(train_xgb[,-2])
+test_matrix <- data.matrix(test_xgb[,-2])
+# convert data to Dmatrix
+dtrain <- xgb.DMatrix(data = train_matrix, label = label_train)
+dtest <- xgb.DMatrix(data = test_matrix, label = label_test)
+```
+```{r}
+params <- list(booster = "gbtree",
+               objective = "binary:logistic",
+               eta=0.7, 
+               gamma=10, 
+               max_depth=10, 
+               min_child_weight=3, 
+               subsample=1, 
+               colsample_bytree=0.5)
+```
+```{r}
+xgbcv <- xgb.cv( params = params, 
+                 data = dtrain,
+                 nrounds = 1000, 
+                 showsd = T, 
+                 nfold = 10,
+                 stratified = T, 
+                 print_every_n = 50, 
+                 early_stopping_rounds = 20, 
+                 maximize = F)
+print(xgbcv)
+```
+```{r}
+xgb1 <- xgb.train (params = params, 
+                   data = dtrain, 
+                   nrounds = xgbcv$best_iteration, 
+                   watchlist = list(val=dtest,train=dtrain),
+                   print_every_n = 100, 
+                   early_stoping_rounds = 10, 
+                   maximize = F , 
+                   eval_metric = "error",
+                   verbosity = 0)
+xgbpred_prob <-predict(object = xgb1, newdata = dtest)
+xgbpred <- ifelse (xgbpred_prob > 0.45,1,0)
+```
+```{r}
+confmat_xgb <- confusionMatrix(as.factor(xgbpred), as.factor(label_test), positive = "1")
+confmat_xgb
+```
+```{r}
+confmat_rf <- confusionMatrix(pred_rf$result, 
+                                 test$STATUS,
+                                 mode = "prec_recall",
+                                 positive = "bad credit")
+eval_rf <- tidy(confmat_rf) %>% 
+  mutate(model = "Random Forest") %>% 
+  select(model, term, estimate) %>% 
+  filter(term %in% c("accuracy", "precision", "recall", "specificity"))
+confmat_xgb <- confusionMatrix(as.factor(xgbpred), as.factor(label_test), positive = "1")
+eval_xgb <- tidy(confmat_xgb) %>% 
+  mutate(model = "XGBoost") %>% 
+  select(model, term, estimate) %>% 
+  filter(term %in% c("accuracy", "precision", "recall", "specificity"))
+```
+```{r}
+eval_result <- rbind(eval_rf, eval_xgb)
+eval_result
+```
+```{r}
+var_imp <- xgb.importance(model = xgb1,
+                          feature_names = dimnames(dtrain)[[2]])
+xgb.ggplot.importance(var_imp,top_n = 10) + 
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+```{r}
+xgb_result <- data.frame(class1 = xgbpred_prob, actual = as.factor(label_test))
+auc_xgb <- roc_auc(data = xgb_result, truth = actual,class1) 
+value_roc_xgb <- prediction(predictions = xgbpred_prob,
+                        labels = label_test)
+# ROC curve
+plot(performance(value_roc_xgb, "tpr", "fpr"))
+```
+```{r}
+value_auc_xgb <- performance(value_roc_xgb, measure = "auc")
+value_auc_xgb@y.values
+```
+```{r}
+explainer <- lime(train_matrix %>% as.data.frame(), xgb1)
+explanation <- explain(test_matrix[11:12,] %>% as.data.frame(),
+                             explainer, 
+                             labels = "1",
+                             n_features = 3,
+                             n_permutations = 5000,
+                             dist_fun = "manhattan",
+                             kernel_width = 0.75,
+                             feature_select = "highest_weights")
+plot_features(explanation)
+```
+
